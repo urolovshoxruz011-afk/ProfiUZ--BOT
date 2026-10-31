@@ -1,0 +1,1225 @@
+
+import os
+import sqlite3
+import logging
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# ================= SOZLAMALAR =================
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB = "profiuz.db"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+CATEGORIES = [
+    "📱 SMM",
+    "🎨 Grafik dizayn",
+    "🤖 AI xizmatlari",
+    "🎬 Video montaj",
+    "📸 Mobilograf",
+    "⭐ Brandface",
+    "👨‍💻 Dasturchi",
+    "🎥 Videograf",
+    "🧊 3D dizayner",
+    "📂 Boshqa xizmatlar",
+]
+
+MENU = [
+    ["🔎 Mutaxassis topish", "⭐ Reyting"],
+    ["📝 Mutaxassis bo‘lib ishlash"],
+    ["📦 Buyurtmalar", "👤 Mening profilim"],
+    ["🚨 Shikoyat qilish"],
+    ["ℹ️ Biz haqimizda"],
+]
+
+
+# ================= MA'LUMOTLAR BAZASI =================
+
+def connect():
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def add_column(con, table, column, definition):
+    columns = [
+        row[1]
+        for row in con.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    ]
+
+    if column not in columns:
+        con.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+
+
+def init_db():
+    con = connect()
+
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY,
+        phone TEXT,
+        accepted INTEGER DEFAULT 0,
+        username TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS specialists(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE,
+        category TEXT,
+        description TEXT,
+        price TEXT,
+        rating REAL DEFAULT 0,
+        votes INTEGER DEFAULT 0,
+        phone_public INTEGER DEFAULT 0,
+        active INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS ratings(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        specialist_id INTEGER,
+        client_id INTEGER,
+        score INTEGER,
+        UNIQUE(specialist_id, client_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS complaints(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id INTEGER,
+        specialist_id INTEGER,
+        status TEXT DEFAULT 'Yangi'
+    );
+    """)
+
+    # Eski bazalarni yangi versiyaga moslashtirish
+    add_column(con, "users", "accepted", "INTEGER DEFAULT 0")
+    add_column(con, "users", "username", "TEXT")
+
+    add_column(con, "specialists", "category", "TEXT")
+    add_column(con, "specialists", "description", "TEXT")
+    add_column(con, "specialists", "price", "TEXT")
+    add_column(con, "specialists", "rating", "REAL DEFAULT 0")
+    add_column(con, "specialists", "votes", "INTEGER DEFAULT 0")
+    add_column(con, "specialists", "phone_public", "INTEGER DEFAULT 0")
+    add_column(con, "specialists", "active", "INTEGER DEFAULT 1")
+
+    add_column(con, "orders", "status", "TEXT DEFAULT 'Yangi'")
+
+    con.commit()
+    con.close()
+
+
+# ================= YORDAMCHI FUNKSIYALAR =================
+
+def kb(rows):
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True
+    )
+
+
+def home():
+    return kb(MENU)
+
+
+def category_keyboard():
+    return kb(
+        [[category] for category in CATEGORIES]
+        + [["🏠 Asosiy menyu"]]
+    )
+
+
+def get_specialist(uid):
+    con = connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM specialists WHERE user_id=?",
+        (uid,)
+    )
+    result = cur.fetchone()
+    con.close()
+    return result
+
+
+async def accepted_user(update):
+    uid = update.effective_user.id
+
+    con = connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT phone, accepted FROM users WHERE id=?",
+        (uid,)
+    )
+    result = cur.fetchone()
+    con.close()
+
+    return bool(result and result[0] and result[1])
+
+
+# ================= START =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    con = connect()
+    con.execute(
+        "INSERT OR IGNORE INTO users(id) VALUES(?)",
+        (user.id,)
+    )
+    con.execute(
+        "UPDATE users SET username=? WHERE id=?",
+        (user.username, user.id)
+    )
+    con.commit()
+
+    cur = con.cursor()
+    cur.execute(
+        "SELECT phone, accepted FROM users WHERE id=?",
+        (user.id,)
+    )
+    data = cur.fetchone()
+    con.close()
+
+    context.user_data.clear()
+
+    if data and data[0] and data[1]:
+        return await update.message.reply_text(
+            "👋 ProfiUz platformasiga xush kelibsiz!",
+            reply_markup=home()
+        )
+
+    await update.message.reply_text(
+        "👋 ProfiUz platformasiga xush kelibsiz!\n\n"
+        "Davom etish uchun telefon raqamingizni yuboring.",
+        reply_markup=kb([[
+            KeyboardButton(
+                "📱 Kontakt yuborish",
+                request_contact=True
+            )
+        ]])
+    )
+
+
+# ================= KONTAKT =================
+
+async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = update.message.contact
+    user = update.effective_user
+
+    if not c or c.user_id != user.id:
+        return await update.message.reply_text(
+            "Iltimos, o‘zingizning kontaktingizni yuboring."
+        )
+
+    con = connect()
+    con.execute(
+        "UPDATE users SET phone=?, username=? WHERE id=?",
+        (c.phone_number, user.username, user.id)
+    )
+    con.commit()
+    con.close()
+
+    context.user_data["state"] = "consent"
+
+    await update.message.reply_text(
+        "📜 PROFIUZ FOYDALANISH SHARTLARI\n\n"
+        "1. ProfiUz mijozlar va mutaxassislarni "
+        "bir-biri bilan topishtirishga yordam beruvchi platforma.\n\n"
+        "2. Bot faqat mutaxassis yoki mijoz topishga "
+        "va ular o‘rtasida aloqa o‘rnatishga yordam beradi.\n\n"
+        "3. ProfiUz xizmatni bevosita bajarmaydi va "
+        "to‘lovlarni qabul qilmaydi.\n\n"
+        "4. Mutaxassis va mijoz o‘rtasidagi kelishuv, "
+        "to‘lov, xizmat sifati va natijalar uchun "
+        "ProfiUz javobgar emas.\n\n"
+        "5. Har bir foydalanuvchi hamkorining ishonchliligini "
+        "mustaqil tekshirishi kerak.\n\n"
+        "6. Firibgarlik va shubhali holatlarni "
+        "adminga xabar qilishingiz mumkin.\n\n"
+        "7. Ushbu shartlar qonunchilikda belgilangan "
+        "huquq va majburiyatlarni bekor qilmaydi.\n\n"
+        "Davom etish orqali shartlarga rozilik bildirasiz.",
+        reply_markup=kb([["✅ Roziman"]])
+    )
+
+
+# ================= MUTAXASSIS PROFILI =================
+
+async def show_profile(update, context):
+    ids = context.user_data.get("ids", [])
+    index = context.user_data.get("index", 0)
+
+    if not ids or index >= len(ids):
+        return await update.message.reply_text(
+            "Bu yo‘nalishda boshqa mutaxassis topilmadi.",
+            reply_markup=kb([
+                ["🔄 Qaytadan ko‘rish"],
+                ["◀️ Orqaga", "🏠 Asosiy menyu"]
+            ])
+        )
+
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT s.id, s.user_id, s.category,
+        s.description, s.price, s.rating,
+        s.votes, s.phone_public, u.phone
+        FROM specialists s
+        LEFT JOIN users u ON u.id=s.user_id
+        WHERE s.id=? AND s.active=1
+    """, (ids[index],))
+
+    p = cur.fetchone()
+    con.close()
+
+    if not p:
+        context.user_data["index"] += 1
+        return await show_profile(update, context)
+
+    sid, uid, category, desc, price, rating, votes, public, phone = p
+
+    phone_text = (
+        f"📞 Telefon: {phone}"
+        if public and phone
+        else "📞 Telefon: Aloqaga chiqish tugmasini bosing."
+    )
+
+    await update.message.reply_text(
+        f"👤 MUTAXASSIS PROFILI\n\n"
+        f"🆔 ID: {sid}\n"
+        f"Yo‘nalish: {category}\n"
+        f"📝 Ma'lumot: {desc}\n"
+        f"💰 Narx: {price}\n"
+        f"⭐ Reyting: {rating or 0:.1f}/5\n"
+        f"📊 Baholar: {votes}\n"
+        f"{phone_text}",
+        reply_markup=kb([
+            ["➡️ Keyingi mutaxassis"],
+            ["💬 Aloqaga chiqish"],
+            ["💬 Buyurtma berish", "⭐ Baho berish"],
+            ["🚨 Shu mutaxassisdan shikoyat"],
+            ["◀️ Orqaga", "🏠 Asosiy menyu"]
+        ])
+    )
+
+
+# ================= ASOSIY XABARLAR =================
+
+async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    uid = update.effective_user.id
+    state = context.user_data.get("state")
+
+    # Rozilik hali berilmagan bo‘lsa
+    if not await accepted_user(update):
+        if state == "consent" and text == "✅ Roziman":
+            con = connect()
+            con.execute(
+                "UPDATE users SET accepted=1 WHERE id=?",
+                (uid,)
+            )
+            con.commit()
+            con.close()
+
+            context.user_data.clear()
+
+            return await update.message.reply_text(
+                "✅ Roziligingiz saqlandi!\n"
+                "ProfiUz asosiy menyusiga xush kelibsiz.",
+                reply_markup=home()
+            )
+
+        return await update.message.reply_text(
+            "Davom etish uchun avval kontaktingizni yuboring "
+            "va foydalanish shartlariga rozilik bildiring."
+        )
+
+    # Asosiy menyu
+    if text == "🏠 Asosiy menyu":
+        context.user_data.clear()
+        return await update.message.reply_text(
+            "🏠 Asosiy menyu",
+            reply_markup=home()
+        )
+
+    # RO‘YXATDAN O‘TISH
+
+    if state == "category":
+        if text not in CATEGORIES:
+            return await update.message.reply_text(
+                "Ro‘yxatdan yo‘nalish tanlang."
+            )
+
+        context.user_data["category"] = text
+        context.user_data["state"] = "description"
+
+        return await update.message.reply_text(
+            "📝 Tajribangiz va xizmatlaringizni yozing:"
+        )
+
+    if state == "description":
+        if len(text.strip()) < 5:
+            return await update.message.reply_text(
+                "Iltimos, kamida 5 ta belgidan iborat ma'lumot yozing."
+            )
+
+        context.user_data["description"] = text.strip()
+        context.user_data["state"] = "price"
+
+        return await update.message.reply_text(
+            "💰 Xizmat narxingizni yozing:"
+        )
+
+    if state == "price":
+        context.user_data["price"] = text.strip()
+        context.user_data["state"] = "phone_public"
+
+        return await update.message.reply_text(
+            "Telefon raqamingiz profilingizda ko‘rsatilsinmi?",
+            reply_markup=kb([
+                ["✅ Ha, ko‘rsatilsin"],
+                ["❌ Yo‘q, yashirilsin"],
+                ["🏠 Asosiy menyu"]
+            ])
+        )
+
+    if state == "phone_public":
+        if text not in [
+            "✅ Ha, ko‘rsatilsin",
+            "❌ Yo‘q, yashirilsin"
+        ]:
+            return await update.message.reply_text(
+                "Tugmalardan birini tanlang."
+            )
+
+        public = 1 if text.startswith("✅") else 0
+
+        con = connect()
+        cur = con.cursor()
+
+        cur.execute(
+            "SELECT id FROM specialists WHERE user_id=?",
+            (uid,)
+        )
+        exists = cur.fetchone()
+
+        if exists:
+            cur.execute("""
+                UPDATE specialists SET
+                category=?, description=?, price=?,
+                phone_public=?, active=1
+                WHERE user_id=?
+            """, (
+                context.user_data["category"],
+                context.user_data["description"],
+                context.user_data["price"],
+                public,
+                uid
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO specialists
+                (user_id, category, description, price, phone_public)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                uid,
+                context.user_data["category"],
+                context.user_data["description"],
+                context.user_data["price"],
+                public
+            ))
+
+        con.commit()
+        con.close()
+
+        context.user_data.clear()
+
+        return await update.message.reply_text(
+            "🎉 Tabriklaymiz! Mutaxassis profilingiz saqlandi "
+            "va platformada e'lon qilindi.",
+            reply_markup=home()
+        )
+
+    # PROFILNI TAHRIRLASH
+
+    if state == "edit_profile":
+        if text == "📝 Ma'lumotni o‘zgartirish":
+            context.user_data["state"] = "edit_description"
+            return await update.message.reply_text(
+                "Yangi ma'lumotni yozing:"
+            )
+
+        if text == "💰 Narxni o‘zgartirish":
+            context.user_data["state"] = "edit_price"
+            return await update.message.reply_text(
+                "Yangi narxni yozing:"
+            )
+
+        if text == "📂 Yo‘nalishni o‘zgartirish":
+            context.user_data["state"] = "edit_category"
+            return await update.message.reply_text(
+                "Yangi yo‘nalishni tanlang:",
+                reply_markup=category_keyboard()
+            )
+
+        if text == "📞 Telefonni ko‘rsatish":
+            con = connect()
+            con.execute(
+                "UPDATE specialists SET phone_public=1 WHERE user_id=?",
+                (uid,)
+            )
+            con.commit()
+            con.close()
+            return await update.message.reply_text(
+                "Telefoningiz ko‘rsatish uchun yoqildi.",
+                reply_markup=home()
+            )
+
+        if text == "📞 Telefonni yashirish":
+            con = connect()
+            con.execute(
+                "UPDATE specialists SET phone_public=0 WHERE user_id=?",
+                (uid,)
+            )
+            con.commit()
+            con.close()
+            return await update.message.reply_text(
+                "Telefoningiz yashirildi.",
+                reply_markup=home()
+            )
+
+        return await update.message.reply_text(
+            "Tugmalardan birini tanlang."
+        )
+
+    if state == "edit_description":
+        con = connect()
+        con.execute(
+            "UPDATE specialists SET description=? WHERE user_id=?",
+            (text.strip(), uid)
+        )
+        con.commit()
+        con.close()
+        context.user_data.clear()
+        return await update.message.reply_text(
+            "✅ Ma'lumot yangilandi.",
+            reply_markup=home()
+        )
+
+    if state == "edit_price":
+        con = connect()
+        con.execute(
+            "UPDATE specialists SET price=? WHERE user_id=?",
+            (text.strip(), uid)
+        )
+        con.commit()
+        con.close()
+        context.user_data.clear()
+        return await update.message.reply_text(
+            "✅ Narx yangilandi.",
+            reply_markup=home()
+        )
+
+    if state == "edit_category":
+        if text not in CATEGORIES:
+            return await update.message.reply_text(
+                "Ro‘yxatdan yo‘nalish tanlang."
+            )
+
+        con = connect()
+        con.execute(
+            "UPDATE specialists SET category=? WHERE user_id=?",
+            (text, uid)
+        )
+        con.commit()
+        con.close()
+        context.user_data.clear()
+
+        return await update.message.reply_text(
+            "✅ Yo‘nalish yangilandi.",
+            reply_markup=home()
+        )
+
+    # PROFILNI YASHIRISH / FAOLLASHTIRISH
+
+    if state == "delete_confirm":
+        if text == "✅ Ha, yashirish":
+            con = connect()
+            con.execute(
+                "UPDATE specialists SET active=0 WHERE user_id=?",
+                (uid,)
+            )
+            con.commit()
+            con.close()
+            context.user_data.clear()
+
+            return await update.message.reply_text(
+                "Profilingiz yashirildi. Ma'lumotlaringiz saqlanib qoldi.",
+                reply_markup=home()
+            )
+
+        if text == "❌ Bekor qilish":
+            context.user_data.clear()
+            return await update.message.reply_text(
+                "Bekor qilindi.",
+                reply_markup=home()
+            )
+
+    # SHIKOYAT
+
+    if state == "complaint":
+        sid = context.user_data.get("complaint_specialist")
+
+        if sid:
+            complaint_text = (
+                f"Mutaxassis ID: {sid}\n{text}"
+            )
+        else:
+            complaint_text = text
+
+        con = connect()
+        con.execute(
+            "INSERT INTO complaints(user_id, message) VALUES(?, ?)",
+            (uid, complaint_text)
+        )
+        con.commit()
+        con.close()
+
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"🚨 YANGI SHIKOYAT\n\n"
+                    f"Foydalanuvchi ID: {uid}\n"
+                    f"{complaint_text}"
+                )
+            except Exception:
+                logger.exception("Adminga shikoyat yuborilmadi")
+
+        context.user_data.clear()
+
+        return await update.message.reply_text(
+            "✅ Shikoyatingiz adminga yuborildi.",
+            reply_markup=home()
+        )
+
+    # REYTING
+
+    if state == "rating":
+        if text not in ["1", "2", "3", "4", "5"]:
+            return await update.message.reply_text(
+                "1 dan 5 gacha baho yuboring."
+            )
+
+        sid = context.user_data["rating_id"]
+
+        con = connect()
+        cur = con.cursor()
+
+        try:
+            cur.execute("""
+                INSERT INTO ratings
+                (specialist_id, client_id, score)
+                VALUES (?, ?, ?)
+            """, (sid, uid, int(text)))
+
+            cur.execute("""
+                UPDATE specialists SET
+                rating=(
+                    SELECT AVG(score) FROM ratings
+                    WHERE specialist_id=?
+                ),
+                votes=(
+                    SELECT COUNT(*) FROM ratings
+                    WHERE specialist_id=?
+                )
+                WHERE id=?
+            """, (sid, sid, sid))
+
+            con.commit()
+            answer = "⭐ Bahoyingiz saqlandi!"
+
+        except sqlite3.IntegrityError:
+            answer = "Siz bu mutaxassisga avval baho bergansiz."
+
+        con.close()
+        context.user_data.clear()
+
+        return await update.message.reply_text(
+            answer,
+            reply_markup=home()
+        )
+
+    # BUYURTMA
+
+    if state == "order":
+        if text == "❌ Bekor qilish":
+            context.user_data.clear()
+            return await update.message.reply_text(
+                "Buyurtma bekor qilindi.",
+                reply_markup=home()
+            )
+
+        if text != "✅ Tasdiqlash":
+            return await update.message.reply_text(
+                "Tasdiqlash yoki bekor qilishni tanlang."
+            )
+
+        sid = context.user_data["order_id"]
+
+        con = connect()
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT user_id FROM specialists
+            WHERE id=? AND active=1
+        """, (sid,))
+
+        specialist = cur.fetchone()
+        order_id = None
+
+        if specialist and specialist[0] != uid:
+            cur.execute("""
+                INSERT INTO orders(client_id, specialist_id)
+                VALUES (?, ?)
+            """, (uid, sid))
+
+            order_id = cur.lastrowid
+            con.commit()
+
+        con.close()
+
+        if order_id:
+            try:
+                await context.bot.send_message(
+                    specialist[0],
+                    f"📦 YANGI BUYURTMA!\n\n"
+                    f"Buyurtma ID: {order_id}\n"
+                    f"Mijoz Telegram ID: {uid}\n"
+                    f"Mijoz username: @{update.effective_user.username or 'mavjud emas'}\n\n"
+                    "Mijoz bilan bog‘lanish uchun Telegram profilingizdan foydalaning."
+                )
+                answer = "✅ Buyurtma mutaxassisga yuborildi!"
+            except Exception:
+                answer = (
+                    "Buyurtma yaratildi, lekin mutaxassisga xabar "
+                    "yetkazilmadi. U botni hali ishga tushirmagan bo‘lishi mumkin."
+                )
+        else:
+            answer = (
+                "Mutaxassis topilmadi yoki o‘zingizga "
+                "buyurtma berolmaysiz."
+            )
+
+        context.user_data.clear()
+
+        return await update.message.reply_text(
+            answer,
+            reply_markup=home()
+        )
+
+    # ASOSIY MENYU
+
+    if text == "📝 Mutaxassis bo‘lib ishlash":
+        existing = get_specialist(uid)
+
+        if existing:
+            return await update.message.reply_text(
+                "Sizda allaqachon profil mavjud. "
+                "Ikkinchi profil ochish mumkin emas.\n"
+                "Profilingizni 'Mening profilim' bo‘limidan boshqaring.",
+                reply_markup=home()
+            )
+
+        context.user_data["state"] = "category"
+
+        return await update.message.reply_text(
+            "Yo‘nalishingizni tanlang:",
+            reply_markup=category_keyboard()
+        )
+
+    if text in ["🔎 Mutaxassis topish", "⭐ Reyting"]:
+        context.user_data["mode"] = (
+            "rating" if text == "⭐ Reyting" else "normal"
+        )
+
+        return await update.message.reply_text(
+            "Yo‘nalishni tanlang:",
+            reply_markup=category_keyboard()
+        )
+
+    if text in CATEGORIES:
+        con = connect()
+        cur = con.cursor()
+
+        if context.user_data.get("mode") == "rating":
+            cur.execute("""
+                SELECT id FROM specialists
+                WHERE category=? AND active=1 AND votes>0
+                ORDER BY rating DESC, votes DESC
+            """, (text,))
+        else:
+            cur.execute("""
+                SELECT id FROM specialists
+                WHERE category=? AND active=1
+                ORDER BY id DESC
+            """, (text,))
+
+        ids = [row[0] for row in cur.fetchall()]
+        con.close()
+
+        context.user_data["ids"] = ids
+        context.user_data["index"] = 0
+
+        return await show_profile(update, context)
+
+    if text == "➡️ Keyingi mutaxassis":
+        context.user_data["index"] = (
+            context.user_data.get("index", 0) + 1
+        )
+        return await show_profile(update, context)
+
+    if text == "🔄 Qaytadan ko‘rish":
+        context.user_data["index"] = 0
+        return await show_profile(update, context)
+
+    if text == "◀️ Orqaga":
+        return await update.message.reply_text(
+            "Yo‘nalishni tanlang:",
+            reply_markup=category_keyboard()
+        )
+
+    # ALOQAGA CHIQISH
+
+    if text == "💬 Aloqaga chiqish":
+        ids = context.user_data.get("ids", [])
+        i = context.user_data.get("index", 0)
+
+        if ids and i < len(ids):
+            con = connect()
+            cur = con.cursor()
+
+            cur.execute("""
+                SELECT s.user_id, u.phone, u.username,
+                s.phone_public
+                FROM specialists s
+                LEFT JOIN users u ON u.id=s.user_id
+                WHERE s.id=? AND s.active=1
+            """, (ids[i],))
+
+            p = cur.fetchone()
+            con.close()
+
+            if p:
+                specialist_uid, phone, username, public = p
+
+                if public and phone:
+                    return await update.message.reply_text(
+                        f"📞 Mutaxassis telefoni: {phone}"
+                    )
+
+                if username:
+                    return await update.message.reply_text(
+                        "💬 Mutaxassis bilan Telegram orqali bog‘laning:",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "Telegram profilini ochish",
+                                url=f"https://t.me/{username}"
+                            )
+                        ]])
+                    )
+
+                return await update.message.reply_text(
+                    "Mutaxassisning Telegram username'i mavjud emas. "
+                    "Buyurtma yuborish orqali aloqa boshlashingiz mumkin."
+                )
+
+        return await update.message.reply_text(
+            "Mutaxassis topilmadi."
+        )
+
+    # BUYURTMA TUGMASI
+
+    if text == "💬 Buyurtma berish":
+        ids = context.user_data.get("ids", [])
+        i = context.user_data.get("index", 0)
+
+        if ids and i < len(ids):
+            context.user_data["order_id"] = ids[i]
+            context.user_data["state"] = "order"
+
+            return await update.message.reply_text(
+                "Buyurtmani tasdiqlaysizmi?",
+                reply_markup=kb([
+                    ["✅ Tasdiqlash"],
+                    ["❌ Bekor qilish"]
+                ])
+            )
+
+    # BAHO BERISH
+
+    if text == "⭐ Baho berish":
+        ids = context.user_data.get("ids", [])
+        i = context.user_data.get("index", 0)
+
+        if ids and i < len(ids):
+            context.user_data["rating_id"] = ids[i]
+            context.user_data["state"] = "rating"
+
+            return await update.message.reply_text(
+                "Necha yulduz berasiz?",
+                reply_markup=kb([
+                    ["1", "2", "3", "4", "5"],
+                    ["🏠 Asosiy menyu"]
+                ])
+            )
+
+    # SHIKOYAT
+
+    if text in [
+        "🚨 Shikoyat qilish",
+        "🚨 Shu mutaxassisdan shikoyat"
+    ]:
+        ids = context.user_data.get("ids", [])
+        i = context.user_data.get("index", 0)
+
+        if (
+            text == "🚨 Shu mutaxassisdan shikoyat"
+            and ids and i < len(ids)
+        ):
+            context.user_data["complaint_specialist"] = ids[i]
+        else:
+            context.user_data.pop(
+                "complaint_specialist", None
+            )
+
+        context.user_data["state"] = "complaint"
+
+        return await update.message.reply_text(
+            "Shikoyatingizni batafsil yozing:"
+        )
+
+    # BUYURTMALAR
+
+    if text == "📦 Buyurtmalar":
+        con = connect()
+        cur = con.cursor()
+
+        cur.execute(
+            "SELECT COUNT(*) FROM orders WHERE client_id=?",
+            (uid,)
+        )
+        client_count = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*) FROM orders
+            WHERE specialist_id IN (
+                SELECT id FROM specialists WHERE user_id=?
+            )
+        """, (uid,))
+        specialist_count = cur.fetchone()[0]
+
+        con.close()
+
+        return await update.message.reply_text(
+            f"📦 BUYURTMALAR\n\n"
+            f"Yuborgan buyurtmalaringiz: {client_count}\n"
+            f"Qabul qilingan so‘rovlar: {specialist_count}",
+            reply_markup=home()
+        )
+
+    # MENING PROFILIM
+
+    if text == "👤 Mening profilim":
+        p = get_specialist(uid)
+
+        if not p:
+            return await update.message.reply_text(
+                "Siz hali mutaxassis sifatida ro‘yxatdan o‘tmagansiz.",
+                reply_markup=home()
+            )
+
+        return await update.message.reply_text(
+            f"👤 PROFILINGIZ\n\n"
+            f"ID: {p[0]}\n"
+            f"Yo‘nalish: {p[2]}\n"
+            f"Ma'lumot: {p[3]}\n"
+            f"Narx: {p[4]}\n"
+            f"Reyting: {p[5] or 0:.1f}/5\n"
+            f"Baholar: {p[6]}\n"
+            f"Holat: {'Faol' if p[8] else 'Yashirilgan'}",
+            reply_markup=kb([
+                ["⚙️ Profilni sozlash"],
+                ["🗑 Profilni yashirish"],
+                ["🔓 Profilni faollashtirish"],
+                ["🏠 Asosiy menyu"]
+            ])
+        )
+
+    # PROFIL SOZLAMALARI
+
+    if text == "⚙️ Profilni sozlash":
+        if not get_specialist(uid):
+            return await update.message.reply_text(
+                "Sizda mutaxassis profili mavjud emas.",
+                reply_markup=home()
+            )
+
+        context.user_data["state"] = "edit_profile"
+
+        return await update.message.reply_text(
+            "Nimani o‘zgartirmoqchisiz?",
+            reply_markup=kb([
+                ["📝 Ma'lumotni o‘zgartirish"],
+                ["💰 Narxni o‘zgartirish"],
+                ["📂 Yo‘nalishni o‘zgartirish"],
+                ["📞 Telefonni ko‘rsatish"],
+                ["📞 Telefonni yashirish"],
+                ["🏠 Asosiy menyu"]
+            ])
+        )
+
+    if text == "🗑 Profilni yashirish":
+        if not get_specialist(uid):
+            return await update.message.reply_text(
+                "Profil topilmadi.",
+                reply_markup=home()
+            )
+
+        context.user_data["state"] = "delete_confirm"
+
+        return await update.message.reply_text(
+            "Profilingizni vaqtincha yashirmoqchimisiz?\n"
+            "Barcha ma'lumotlaringiz saqlanadi.",
+            reply_markup=kb([
+                ["✅ Ha, yashirish"],
+                ["❌ Bekor qilish"]
+            ])
+        )
+
+    if text == "🔓 Profilni faollashtirish":
+        con = connect()
+        cur = con.cursor()
+
+        cur.execute(
+            "UPDATE specialists SET active=1 WHERE user_id=?",
+            (uid,)
+        )
+
+        changed = cur.rowcount
+        con.commit()
+        con.close()
+
+        if changed:
+            return await update.message.reply_text(
+                "✅ Profilingiz yana faollashtirildi!",
+                reply_markup=home()
+            )
+
+        return await update.message.reply_text(
+            "Profil topilmadi.",
+            reply_markup=home()
+        )
+
+    # BIZ HAQIMIZDA
+
+    if text == "ℹ️ Biz haqimizda":
+        return await update.message.reply_text(
+            "🚀 ProfiUz — mijozlar va mutaxassislarni "
+            "birlashtiruvchi platforma.\n\n"
+            "Biz sizga kerakli xizmatni topish "
+            "va o‘z xizmatlaringizni taklif qilishga yordam beramiz.",
+            reply_markup=home()
+        )
+
+    await update.message.reply_text(
+        "Menyudagi tugmalardan foydalaning.",
+        reply_markup=home()
+    )
+
+
+# ================= ADMIN BUYRUQLARI =================
+
+async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            "Foydalanish: /block USER_ID"
+        )
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("ID noto‘g‘ri.")
+
+    con = connect()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE specialists SET active=0 WHERE user_id=?",
+        (target,)
+    )
+    changed = cur.rowcount
+    con.commit()
+    con.close()
+
+    if changed:
+        await update.message.reply_text(
+            "⛔ Mutaxassis bloklandi."
+        )
+    else:
+        await update.message.reply_text(
+            "Bunday mutaxassis topilmadi."
+        )
+
+
+async def unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            "Foydalanish: /unblock USER_ID"
+        )
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("ID noto‘g‘ri.")
+
+    con = connect()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE specialists SET active=1 WHERE user_id=?",
+        (target,)
+    )
+    changed = cur.rowcount
+    con.commit()
+    con.close()
+
+    if changed:
+        await update.message.reply_text(
+            "✅ Mutaxassis blokdan chiqarildi."
+        )
+    else:
+        await update.message.reply_text(
+            "Bunday mutaxassis topilmadi."
+        )
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM specialists WHERE active=1"
+    )
+    specialists = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM complaints")
+    complaints = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM orders")
+    orders = cur.fetchone()[0]
+
+    con.close()
+
+    await update.message.reply_text(
+        f"📊 PROFIUZ STATISTIKA\n\n"
+        f"👥 Foydalanuvchilar: {users}\n"
+        f"👨‍💻 Faol mutaxassislar: {specialists}\n"
+        f"🚨 Shikoyatlar: {complaints}\n"
+        f"📦 Buyurtmalar: {orders}"
+    )
+
+
+# ================= XATOLARNI QAYD ETISH =================
+
+async def error_handler(update, context):
+    logger.error(
+        "Update vaqtida xatolik yuz berdi:",
+        exc_info=context.error
+    )
+
+
+# ================= BOTNI ISHGA TUSHIRISH =================
+
+def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN topilmadi! Windows muhit o‘zgaruvchilarini tekshiring."
+        )
+
+    if not ADMIN_ID:
+        logger.warning(
+            "ADMIN_ID sozlanmagan. Admin buyruqlari ishlamaydi."
+        )
+
+    init_db()
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("block", block))
+    app.add_handler(CommandHandler("unblock", unblock))
+    app.add_handler(CommandHandler("admin", admin))
+
+    app.add_handler(
+        MessageHandler(filters.CONTACT, contact)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message
+        )
+    )
+
+    app.add_error_handler(error_handler)
+
+    print("================================")
+    print("PROFIUZ BOT ISHGA TUSHDI!")
+    print("Bot ishlashga tayyor.")
+    print("================================")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
